@@ -87,6 +87,12 @@ state: dict = {
     "next_check": None,
     "http_failures": {},
     "http_alerted_at": {},
+    "last_http_status": None,
+    "last_http_url": None,
+    "last_cards_count": 0,
+    "last_new_count": 0,
+    "last_skip_count": 0,
+    "seen_count": 0,
 }
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -273,6 +279,8 @@ async def fetch_page(session: aiohttp.ClientSession, url: str, app: Application)
         async with session.get(
             url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=30)
         ) as r:
+            state["last_http_status"] = r.status
+            state["last_http_url"] = url
             if r.status == 200:
                 reset_http_failures()
                 return await r.text()
@@ -310,6 +318,9 @@ def parse_listings(html: str) -> list[dict]:
 
             title_el = (
                 card.select_one("[data-testid='ad-title']")
+                or card.select_one("[data-cy='ad-card-title']")
+                or card.select_one("a[href] h4")
+                or card.select_one("a[href] h6")
                 or card.select_one("h4")
                 or card.select_one("h6")
             )
@@ -339,6 +350,11 @@ def parse_listings(html: str) -> list[dict]:
 
             location_el = card.select_one("p[data-testid='location-date']")
             location = location_el.get_text(strip=True) if location_el else ""
+
+            if title_el is None and link_el:
+                title = (link_el.get("title") or "").strip() or title
+            if title_el is None and img_el:
+                title = (img_el.get("alt") or "").strip() or title
 
             results.append(
                 {
@@ -417,6 +433,7 @@ async def check_filter(
         return 0, 0
 
     ads = parse_listings(html)
+    state["last_cards_count"] = len(ads)
     log.info('"%s": %d карток', label or url[:50], len(ads))
 
     s = load_stats()
@@ -442,6 +459,9 @@ async def check_filter(
     seen.clear()
     seen.update(seen_trimmed)
     save_seen(seen)
+    state["last_new_count"] = new_count
+    state["last_skip_count"] = skip_count
+    state["seen_count"] = len(seen)
 
     log.info("Нових: %d | пропущено старих: %d", new_count, skip_count)
     return new_count, skip_count
@@ -512,6 +532,8 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fl = load_filters()
     seen = load_seen()
+    state["seen_count"] = len(seen)
+    runtime_seen = max(len(seen), int(state.get("seen_count", 0)))
     max_age = ctx.bot_data.get("max_age", MAX_AGE_MIN)
     paused = "⏸ Призупинено" if state["paused"] else "✅ Активний"
     last_s = state["last_check"].strftime("%H:%M:%S") if state["last_check"] else "—"
@@ -528,6 +550,36 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Остання перевірка: {last_s}\n"
         f"Наступна перевірка: {next_s}\n"
         f"Поточний фільтр: _{escape_md(cur)}_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@admin_only
+async def cmd_status_v2(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    fl = load_filters()
+    seen = load_seen()
+    runtime_seen = max(len(seen), int(state.get("seen_count", 0)))
+    max_age = ctx.bot_data.get("max_age", MAX_AGE_MIN)
+    paused = "⏸ Призупинено" if state["paused"] else "✅ Активний"
+    last_s = state["last_check"].strftime("%H:%M:%S") if state["last_check"] else "—"
+    next_s = state["next_check"].strftime("%H:%M:%S") if state["next_check"] else "—"
+    idx = state["current_filter_idx"] % len(fl) if fl else 0
+    cur = fl[idx].get("label", f"#{idx + 1}") if fl else "немає"
+    http_status = state["last_http_status"] if state["last_http_status"] is not None else "—"
+    await update.message.reply_text(
+        f"📡 *Стан бота*\n\n"
+        f"Статус: {paused}\n"
+        f"Фільтрів: {len(fl)}\n"
+        f"Переглянутих ID: {runtime_seen} / {MAX_SEEN_IDS}\n"
+        f"Макс. вік оголошення: {max_age} хв\n"
+        f"Затримка: {DELAY_MIN}–{DELAY_MAX} сек\n\n"
+        f"Остання перевірка: {last_s}\n"
+        f"Наступна перевірка: {next_s}\n"
+        f"Поточний фільтр: _{escape_md(cur)}_\n\n"
+        f"HTTP останнього запиту: {http_status}\n"
+        f"Знайдено карток останній раз: {state['last_cards_count']}\n"
+        f"Нових / старих останній раз: {state['last_new_count']} / {state['last_skip_count']}\n"
+        f"seen_ids.json: `{SEEN_FILE.resolve()}`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -726,7 +778,7 @@ async def handle_menu_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         clear_pending_action(ctx)
 
     if text == "📡 Статус":
-        await cmd_status(update, ctx)
+        await cmd_status_v2(update, ctx)
         return
     if text == "🔍 Перевірити":
         await cmd_check(update, ctx)
@@ -913,7 +965,7 @@ def main():
         ("start", cmd_start),
         ("help", cmd_start),
         ("menu", cmd_menu),
-        ("status", cmd_status),
+        ("status", cmd_status_v2),
         ("filters", cmd_filters),
         ("add", cmd_add),
         ("remove", cmd_remove),
