@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 from bs4 import BeautifulSoup
-from telegram import Update
+from telegram import ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -79,6 +79,16 @@ state: dict = {
     "last_check": None,
     "next_check": None,
 }
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["📡 Статус", "🔍 Перевірити", "📋 Фільтри"],
+        ["⏸ Пауза", "▶️ Продовжити", "📊 Статистика"],
+        ["🗑 Очистити seen", "ℹ️ Допомога"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 # ── JSON utils ──────────────────────────────────────────────────────────────
 
@@ -372,8 +382,45 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "▶️ /resume — відновити\n"
         "⏱ /setage `хвилин` — вік оголошення\n"
         "📊 /stats — статистика\n"
-        "🗑 /clearseen — скинути переглянуті",
+        "🗑 /clearseen — скинути переглянуті\n\n"
+        "Кнопки нижче дублюють основні команди.",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+@admin_only
+async def handle_menu_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+
+    if text == "📡 Статус":
+        await cmd_status(update, ctx)
+        return
+    if text == "🔍 Перевірити":
+        await cmd_check(update, ctx)
+        return
+    if text == "📋 Фільтри":
+        await cmd_filters(update, ctx)
+        return
+    if text == "⏸ Пауза":
+        await cmd_pause(update, ctx)
+        return
+    if text == "▶️ Продовжити":
+        await cmd_resume(update, ctx)
+        return
+    if text == "📊 Статистика":
+        await cmd_stats(update, ctx)
+        return
+    if text == "🗑 Очистити seen":
+        await cmd_clearseen(update, ctx)
+        return
+    if text == "ℹ️ Допомога":
+        await cmd_start(update, ctx)
+        return
+
+    await update.message.reply_text(
+        "Для керування використовуй кнопки нижче або команди через `/start`.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=MAIN_KEYBOARD,
     )
 
 @admin_only
@@ -537,7 +584,10 @@ async def cmd_clearseen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.message and str(update.effective_chat.id) == CHAT_ID:
-        await update.message.reply_text("❓ Невідома команда. /start — довідка")
+        await update.message.reply_text(
+            "❓ Невідома команда. /start — довідка",
+            reply_markup=MAIN_KEYBOARD,
+        )
 
 # ── Цикл парсингу ────────────────────────────────────────────────────────────
 
@@ -594,9 +644,10 @@ async def post_init(app: Application):
             f"📋 Фільтрів: {len(fl)}\n"
             f"⏱ Макс\\. вік: {app.bot_data['max_age']} хв\n"
             f"🔄 Затримка: {DELAY_MIN}–{DELAY_MAX} сек\n\n"
-            "Напиши /start щоб побачити команди"
+            "Напиши /start або користуйся кнопками нижче"
         ),
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=MAIN_KEYBOARD,
     )
     asyncio.create_task(parser_loop(app))
 
@@ -619,6 +670,7 @@ def main():
     ]:
         app.add_handler(CommandHandler(cmd, handler))
     app.add_handler(MessageHandler(tg_filters.COMMAND, cmd_unknown))
+    app.add_handler(MessageHandler(tg_filters.TEXT & ~tg_filters.COMMAND, handle_menu_text))
     log.info("Polling started")
     app.run_polling(drop_pending_updates=True)
 
