@@ -82,6 +82,7 @@ if not BOT_TOKEN or not CHAT_ID:
 
 state: dict = {
     "paused": False,
+    "loop_running": False,  # True поки parser_loop живий
     "current_filter_idx": 0,
     "last_check": None,
     "next_check": None,
@@ -198,28 +199,64 @@ def export_filters_text() -> str:
     return "\n".join(lines)
 
 
+MONTHS_UK = {
+    "січня": 1, "лютого": 2, "березня": 3, "квітня": 4,
+    "травня": 5, "червня": 6, "липня": 7, "серпня": 8,
+    "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12,
+    # Російські назви на випадок мікс-контенту
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
+    "мая": 5, "июня": 6, "июля": 7, "августа": 8,
+    "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+}
+
+
 def parse_ad_time(location_date_text: str) -> datetime | None:
     now = datetime.now(KYIV_TZ)
     text = location_date_text.strip().lower()
+
+    # Формат "Сьогодні 14:35" або "Сегодня 14:35"
     m = re.search(r"(\d{1,2}):(\d{2})", text)
-    if not m:
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
+        if any(w in text for w in ("сьогодні", "сегодня", "today")):
+            return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if any(w in text for w in ("учора", "вчора", "вчера", "yesterday")):
+            return (now - timedelta(days=1)).replace(
+                hour=hour, minute=minute, second=0, microsecond=0
+            )
         return None
-    hour, minute = int(m.group(1)), int(m.group(2))
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        return None
-    if any(w in text for w in ("сьогодні", "сегодня", "today")):
-        return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if any(w in text for w in ("учора", "вчера", "yesterday")):
-        return (now - timedelta(days=1)).replace(
-            hour=hour, minute=minute, second=0, microsecond=0
-        )
+
+    # Формат "12 квітня 2026 р." або "12 квітня 2026"
+    m2 = re.search(r"(\d{1,2})\s+([а-яіїєґёa-z]+)\s+(\d{4})", text)
+    if m2:
+        day = int(m2.group(1))
+        month_word = m2.group(2)
+        year = int(m2.group(3))
+        month = MONTHS_UK.get(month_word)
+        if month:
+            try:
+                return datetime(year, month, day, 12, 0, tzinfo=KYIV_TZ)
+            except ValueError:
+                return None
+
     return None
 
 
 def is_fresh(ad: dict, max_age_minutes: int) -> bool:
+    """
+    Повертає True якщо оголошення достатньо свіже.
+    Якщо час взагалі не вдається розпізнати — повертає True,
+    щоб не губити оголошення без дати (краще зайве, ніж пропустити).
+    """
     ad_time = parse_ad_time(ad.get("location", ""))
     if ad_time is None:
-        return False
+        # Час не знайдено — пропускаємо лише якщо location явно каже "вчора/учора"
+        loc_low = ad.get("location", "").lower()
+        if any(w in loc_low for w in ("учора", "вчора", "вчера", "yesterday")):
+            return False
+        return True  # Невідомий час — відправляємо, щоб не пропустити
     age = (datetime.now(KYIV_TZ) - ad_time).total_seconds() / 60
     return -2 <= age <= max_age_minutes
 
@@ -310,25 +347,71 @@ async def fetch_page(session: aiohttp.ClientSession, url: str, app: Application)
 def parse_listings(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
     results = []
-    for card in soup.select("div[data-cy='l-card']"):
+
+    # OLX змінював розмітку — пробуємо всі відомі варіанти селекторів карток.
+    # Новий OLX (2025+): картки не мають data-cy='l-card', але всередині є
+    # [data-testid='ad-card-title'] — знаходимо їх і беремо батьківський контейнер.
+    cards = soup.select("div[data-cy='l-card']") or soup.select("li[data-cy='l-card']")
+
+    if not cards:
+        # Новий layout: шукаємо по внутрішньому елементу і піднімаємось до контейнера
+        title_anchors = soup.select("[data-testid='ad-card-title']")
+        seen_containers = set()
+        container_list = []
+        for el in title_anchors:
+            # Піднімаємось до спільного контейнера картки (4–6 рівнів вгору)
+            container = el
+            for _ in range(8):
+                parent = container.parent
+                if parent is None or parent.name in ("body", "html", "[document]"):
+                    break
+                container = parent
+                cid = id(container)
+                if cid not in seen_containers:
+                    # Перевіряємо що контейнер містить і ціну і посилання
+                    if container.select_one("[data-testid='ad-price']") and container.select_one("a[href]"):
+                        seen_containers.add(cid)
+                        container_list.append(container)
+                        break
+        cards = container_list
+
+    log.debug("parse_listings: знайдено %d карток", len(cards))
+
+    for card in cards:
         try:
-            ad_id = card.get("id", "").strip()
+            # ID: шукаємо спочатку атрибут id/data-id, потім витягуємо з URL
+            ad_id = (card.get("id") or card.get("data-id") or "").strip()
+            if not ad_id:
+                link_tmp = card.select_one("a[href]")
+                if link_tmp:
+                    href = link_tmp.get("href", "")
+                    # Новий формат: /d/uk/obyavlenie/назва-ID10h2JW.html
+                    # Старий формат: /uk/назва/123456789.html
+                    m = re.search(r"-([A-Za-z0-9]{6,}?)\.html", href)
+                    if m:
+                        ad_id = m.group(1)
             if not ad_id:
                 continue
 
             title_el = (
-                card.select_one("[data-testid='ad-title']")
-                or card.select_one("[data-cy='ad-card-title']")
-                or card.select_one("a[href] h4")
-                or card.select_one("a[href] h6")
+                card.select_one("[data-testid='ad-card-title'] h4")
+                or card.select_one("[data-testid='ad-card-title'] h6")
+                or card.select_one("[data-testid='ad-card-title'] h3")
+                or card.select_one("[data-testid='ad-card-title'] a")
+                or card.select_one("[data-testid='ad-title']")
+                or card.select_one("[data-cy='ad-card-title'] h4")
+                or card.select_one("[data-cy='ad-card-title'] h6")
                 or card.select_one("h4")
                 or card.select_one("h6")
+                or card.select_one("h3")
             )
             title = title_el.get_text(strip=True) if title_el else "Без назви"
 
             price_el = (
                 card.select_one("p[data-testid='ad-price']")
+                or card.select_one("[data-testid='ad-price']")
                 or card.select_one(".price-label")
+                or card.select_one("strong[data-testid]")
             )
             price = price_el.get_text(strip=True) if price_el else "Ціна не вказана"
 
@@ -342,19 +425,25 @@ def parse_listings(html: str) -> list[dict]:
             img_el = card.select_one("img")
             image = None
             if img_el:
-                for attr in ("src", "data-src"):
+                for attr in ("src", "data-src", "data-lazy-src"):
                     val = img_el.get(attr, "")
                     if val and "placeholder" not in val and not val.startswith("data:"):
                         image = val
                         break
 
-            location_el = card.select_one("p[data-testid='location-date']")
+            location_el = (
+                card.select_one("p[data-testid='location-date']")
+                or card.select_one("[data-testid='location-date']")
+                or card.select_one("p[data-cy='location-date']")
+            )
             location = location_el.get_text(strip=True) if location_el else ""
 
-            if title_el is None and link_el:
-                title = (link_el.get("title") or "").strip() or title
-            if title_el is None and img_el:
-                title = (img_el.get("alt") or "").strip() or title
+            # Fallback для заголовка через alt зображення або title посилання
+            if title == "Без назви":
+                if link_el:
+                    title = (link_el.get("title") or "").strip() or title
+                if img_el:
+                    title = (img_el.get("alt") or "").strip() or title
 
             results.append(
                 {
@@ -560,26 +649,33 @@ async def cmd_status_v2(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     seen = load_seen()
     runtime_seen = max(len(seen), int(state.get("seen_count", 0)))
     max_age = ctx.bot_data.get("max_age", MAX_AGE_MIN)
-    paused = "⏸ Призупинено" if state["paused"] else "✅ Активний"
+
+    if not state["loop_running"]:
+        bot_status = "🔴 Loop не запущений"
+    elif state["paused"]:
+        bot_status = "⏸ Призупинено"
+    else:
+        bot_status = "✅ Активний"
+
     last_s = state["last_check"].strftime("%H:%M:%S") if state["last_check"] else "—"
     next_s = state["next_check"].strftime("%H:%M:%S") if state["next_check"] else "—"
     idx = state["current_filter_idx"] % len(fl) if fl else 0
     cur = fl[idx].get("label", f"#{idx + 1}") if fl else "немає"
     http_status = state["last_http_status"] if state["last_http_status"] is not None else "—"
+    http_ok = "✅" if state["last_http_status"] == 200 else ("⚠️" if state["last_http_status"] else "")
     await update.message.reply_text(
         f"📡 *Стан бота*\n\n"
-        f"Статус: {paused}\n"
+        f"Статус: {bot_status}\n"
         f"Фільтрів: {len(fl)}\n"
         f"Переглянутих ID: {runtime_seen} / {MAX_SEEN_IDS}\n"
-        f"Макс. вік оголошення: {max_age} хв\n"
+        f"Макс\\. вік оголошення: {max_age} хв\n"
         f"Затримка: {DELAY_MIN}–{DELAY_MAX} сек\n\n"
         f"Остання перевірка: {last_s}\n"
         f"Наступна перевірка: {next_s}\n"
         f"Поточний фільтр: _{escape_md(cur)}_\n\n"
-        f"HTTP останнього запиту: {http_status}\n"
-        f"Знайдено карток останній раз: {state['last_cards_count']}\n"
-        f"Нових / старих останній раз: {state['last_new_count']} / {state['last_skip_count']}\n"
-        f"seen_ids.json: `{SEEN_FILE.resolve()}`",
+        f"HTTP останнього запиту: {http_ok} {http_status}\n"
+        f"Знайдено карток: {state['last_cards_count']}\n"
+        f"Нових / старих: {state['last_new_count']} / {state['last_skip_count']}",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -900,43 +996,48 @@ async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def parser_loop(app: Application):
     log.info("Цикл парсингу запущений")
+    state["loop_running"] = True
     seen = load_seen()
 
     connector = aiohttp.TCPConnector(limit=5, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        while True:
-            if state["paused"]:
-                await asyncio.sleep(10)
-                continue
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            while True:
+                if state["paused"]:
+                    await asyncio.sleep(10)
+                    continue
 
-            fl = load_filters()
-            if not fl:
-                log.warning("Немає фільтрів — чекаю 30 сек")
-                await asyncio.sleep(30)
-                continue
+                fl = load_filters()
+                if not fl:
+                    log.warning("Немає фільтрів — чекаю 30 сек")
+                    await asyncio.sleep(30)
+                    continue
 
-            idx = state["current_filter_idx"] % len(fl)
-            f = fl[idx]
-            max_age = app.bot_data.get("max_age", MAX_AGE_MIN)
+                idx = state["current_filter_idx"] % len(fl)
+                f = fl[idx]
+                max_age = app.bot_data.get("max_age", MAX_AGE_MIN)
 
-            state["last_check"] = datetime.now(KYIV_TZ)
+                state["last_check"] = datetime.now(KYIV_TZ)
 
-            try:
-                await check_filter(session, app, seen, f, max_age)
-            except Exception as e:
-                log.error("Цикл: %s", e)
-                await notify_error(app, f"❌ *Критична помилка циклу*\n`{e}`")
+                try:
+                    await check_filter(session, app, seen, f, max_age)
+                except Exception as e:
+                    log.error("Цикл: %s", e)
+                    await notify_error(app, f"❌ *Критична помилка циклу*\n`{e}`")
 
-            state["current_filter_idx"] += 1
-            delay = random.randint(DELAY_MIN, DELAY_MAX)
+                state["current_filter_idx"] += 1
+                delay = random.randint(DELAY_MIN, DELAY_MAX)
 
-            next_fl = load_filters()
-            next_idx = state["current_filter_idx"] % len(next_fl) if next_fl else 0
-            next_lbl = next_fl[next_idx].get("label", f"#{next_idx + 1}") if next_fl else "—"
-            state["next_check"] = datetime.now(KYIV_TZ) + timedelta(seconds=delay)
+                next_fl = load_filters()
+                next_idx = state["current_filter_idx"] % len(next_fl) if next_fl else 0
+                next_lbl = next_fl[next_idx].get("label", f"#{next_idx + 1}") if next_fl else "—"
+                state["next_check"] = datetime.now(KYIV_TZ) + timedelta(seconds=delay)
 
-            log.info('Наступний: "%s" через %d сек.', next_lbl, delay)
-            await asyncio.sleep(delay)
+                log.info('Наступний: "%s" через %d сек.', next_lbl, delay)
+                await asyncio.sleep(delay)
+    finally:
+        state["loop_running"] = False
+        log.error("parser_loop завершився несподівано!")
 
 
 async def post_init(app: Application):
